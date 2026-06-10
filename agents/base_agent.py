@@ -1,44 +1,74 @@
 import os
 from datetime import datetime, timezone
+from typing import Optional
+
+from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.collection import Collection
 
-# Маппинг логических имён коллекций → реальные имена в MongoDB
+load_dotenv()
+
+
 COLLECTION_MAP = {
-    "review_logs":  os.environ.get("COLLECTION_REVIEW_LOGS",  "sandmark-history"),
+    "review_logs": os.environ.get("COLLECTION_REVIEW_LOGS", "sandmark-history"),
     "requirements": os.environ.get("COLLECTION_REQUIREMENTS", "requirements"),
-    "risks":        os.environ.get("COLLECTION_RISKS",        "risks"),
-    "soup_register":os.environ.get("COLLECTION_SOUP",         "soup_register"),
+    "risks": os.environ.get("COLLECTION_RISKS", "risks"),
+    "soup_register": os.environ.get("COLLECTION_SOUP", "soup_register"),
 }
 
 
 class BaseAgent:
-    """Base class providing MongoDB connection and shared utilities."""
+    """Base class for all QualityMetrics agents."""
 
     def __init__(self):
-        uri     = os.environ.get("MONGODB_URI", "mongodb://localhost:27017")
-        db_name = os.environ.get("MONGO_DB_NAME", "sandmark-db")
+        uri = os.environ.get("MONGODB_URI")
+        db_name = os.environ.get("MONGO_DB_NAME")
+
+        if not uri:
+            raise ValueError("MONGODB_URI is missing. Add it to .env or environment variables.")
+        if not db_name:
+            raise ValueError("MONGO_DB_NAME is missing. Add it to .env or environment variables.")
+
         self.client = MongoClient(uri)
-        self.db     = self.client[db_name]
+        self.db = self.client[db_name]
 
     def collection(self, name: str) -> Collection:
+        """Return a MongoDB collection by logical or real name."""
         real_name = COLLECTION_MAP.get(name, name)
         return self.db[real_name]
 
     def trend_label(self, current: float, previous: float) -> tuple[str, float]:
-        if previous == 0:
-            return "stable", 0.0
         delta = round(current - previous, 4)
+        if previous == 0 and current == 0:
+            return "stable", 0.0
         if delta > 0:
             return "up", delta
-        elif delta < 0:
+        if delta < 0:
             return "down", delta
         return "stable", 0.0
 
-    def low_sample_warning(self, n: int, threshold: int = 30) -> str | None:
+    def low_sample_warning(self, n: int, threshold: int = 30) -> Optional[str]:
         if n < threshold:
-            return f"Sample size {n} is below {threshold}; trend may not be statistically significant."
+            return f"Sample size {n} is below {threshold}; result may be less reliable."
         return None
+
+    def parse_datetime(self, value) -> Optional[datetime]:
+        """Parse Mongo Date or ISO string into timezone-aware datetime."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
 
     def run(self) -> dict:
         raise NotImplementedError

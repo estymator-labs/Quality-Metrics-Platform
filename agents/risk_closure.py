@@ -1,69 +1,74 @@
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+
 from .base_agent import BaseAgent
 
 
 class RiskClosureAgent(BaseAgent):
-    """closure_rate = closed_risks / total_risks * 100"""
+    """Percentage of closed or mitigated risks."""
+
+    CLOSED_STATUSES = {"closed", "mitigated", "accepted", "resolved", "done"}
+
+    def _is_closed(self, risk) -> bool:
+        status = str(risk.get("status") or risk.get("mitigation_status") or "").lower()
+        return risk.get("closed_at") is not None or status in self.CLOSED_STATUSES
 
     def run(self) -> dict:
         col = self.collection("risks")
         all_risks = list(col.find({}))
         total = len(all_risks)
+
         now = datetime.now(tz=timezone.utc)
         overdue_threshold = now - timedelta(days=30)
 
-        closed = [r for r in all_risks if r.get("closed_at") is not None]
+        closed = [risk for risk in all_risks if self._is_closed(risk)]
         closure_rate = round(len(closed) / total * 100, 2) if total else 0.0
 
-        # By severity
         by_severity: dict[str, dict] = defaultdict(lambda: {"total": 0, "closed": 0})
         overdue_risks = []
 
-        for r in all_risks:
-            sev = r.get("severity", "unknown")
-            by_severity[sev]["total"] += 1
-            if r.get("closed_at") is not None:
-                by_severity[sev]["closed"] += 1
-            else:
-                created_at = r.get("created_at")
-                if created_at:
-                    try:
-                        created_dt = datetime.fromisoformat(str(created_at))
-                        if created_dt.tzinfo is None:
-                            created_dt = created_dt.replace(tzinfo=timezone.utc)
-                        if created_dt < overdue_threshold:
-                            overdue_risks.append({
-                                "risk_id": r.get("risk_id"),
-                                "severity": sev,
-                                "mitigation_status": r.get("mitigation_status"),
-                                "days_open": (now - created_dt).days,
-                            })
-                    except Exception:
-                        pass
+        for risk in all_risks:
+            severity = risk.get("severity") or risk.get("risk_class") or "unknown"
+            by_severity[severity]["total"] += 1
+
+            if self._is_closed(risk):
+                by_severity[severity]["closed"] += 1
+                continue
+
+            due_date = risk.get("due_date") or risk.get("deadline") or risk.get("target_date")
+            created_at = risk.get("created_at")
+            compare_date = self.parse_datetime(due_date) or self.parse_datetime(created_at)
+
+            if compare_date and compare_date < overdue_threshold:
+                overdue_risks.append({
+                    "risk_id": risk.get("risk_id") or str(risk.get("_id")),
+                    "severity": severity,
+                    "mitigation_status": risk.get("mitigation_status") or risk.get("status") or "open",
+                    "days_open": (now - compare_date).days,
+                })
 
         severity_rates = {
-            sev: {
-                "closure_rate": round(v["closed"] / v["total"] * 100, 2) if v["total"] else 0.0,
-                "closed": v["closed"],
-                "total": v["total"],
+            severity: {
+                "closure_rate": round(values["closed"] / values["total"] * 100, 2) if values["total"] else 0.0,
+                "closed": values["closed"],
+                "total": values["total"],
             }
-            for sev, v in by_severity.items()
+            for severity, values in by_severity.items()
         }
 
-        n = total
         return {
-            "metric": "risk_closure_rate",
+            "metric": "risk_closure",
             "value": closure_rate,
-            "unit": "percent closed",
-            "trend": "n/a",
-            "trend_delta": 0.0,
+            "unit": "% closed risks",
+            "trend": "not_calculated",
+            "trend_delta": None,
             "period": "current",
-            "sample_size": n,
-            "warning": self.low_sample_warning(n),
+            "sample_size": total,
+            "warning": "No documents found in risks collection" if total == 0 else self.low_sample_warning(total),
             "details": {
                 "total_risks": total,
                 "closed_risks": len(closed),
+                "open_risks": total - len(closed),
                 "by_severity": severity_rates,
                 "overdue_risks": overdue_risks,
             },
