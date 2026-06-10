@@ -1,123 +1,173 @@
 # QualityMetrics
 
-Moduł analityczny do projektu **Sandmark** — zbiera dane z przeglądów kodu AI i oblicza metryki jakości dla całej organizacji.
+> Analytical module for the **Sandmark** platform — aggregates AI code review data from MongoDB and exposes management-level quality metrics via a REST API.
 
 ---
 
-## Czym jest Sandmark?
+## Table of Contents
 
-**Sandmark** to wewnętrzna aplikacja, która:
-1. Pobiera diff z GitLab Merge Request
-2. Wysyła go do Google Gemini z promptem do code review
-3. Zapisuje strukturyzowany wynik (`review_json`) do MongoDB
-
-Każdy przegląd ląduje w kolekcji `sandmark-history` jako dokument z komentarzami Gemini podzielonymi na typy: `bug`, `suggestion`, `style`, `performance`, `security`.
-
----
-
-## Po co QualityMetrics?
-
-Sandmark generuje dane — QualityMetrics zamienia je w **metryki zarządcze**.
-
-Zamiast ręcznie przeglądać setki dokumentów w Mongo, wywołujesz jeden endpoint i dostajesz gotowe liczby: ile bugów znajdował Gemini w tym miesiącu, które pliki są najbardziej problematyczne, czy pokrycie wymagań testami rośnie czy spada.
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Metrics Reference](#metrics-reference)
+- [Project Structure](#project-structure)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [Data Schema](#data-schema)
+- [Seeding Test Data](#seeding-test-data)
+- [Dependencies](#dependencies)
 
 ---
 
-## Metryki
+## Overview
 
-| Agent | Co mierzy | Źródło danych |
-|---|---|---|
-| `review_density` | Średnia liczba komentarzy Gemini na MR | `sandmark-history` |
-| `defect_escape` | % MR z co najmniej jednym bug-komentarzem + top problematycznych plików | `sandmark-history` |
-| `traceability` | % wymagań pokrytych testami | kolekcja `requirements` |
-| `risk_closure` | % zamkniętych ryzyk + przeterminowane pozycje | kolekcja `risks` |
-| `soup_completeness` | Kompletność rejestru bibliotek zewnętrznych (SOUP) | kolekcja `soup_register` |
+**Sandmark** is an internal tool that fetches diffs from GitLab Merge Requests, sends them to Google Gemini for code review, and stores structured results in MongoDB (`sandmark-history` collection).
+
+**QualityMetrics** builds on top of that data — it turns hundreds of raw review documents into actionable numbers: how many bugs Gemini flagged this month, which files are most problematic, whether test coverage of requirements is improving or declining.
+
+Key properties:
+
+- **Read-only** — QualityMetrics never writes to or modifies any collection.
+- **Trend-aware** — every metric is compared against the previous 30-day window and returns a `trend` label (`up` / `down` / `stable`) with a numeric delta.
+- **Sample-size guarded** — responses include a `warning` field when fewer than 30 data points are available.
 
 ---
 
-## Struktura projektu
+## Architecture
+
+```
+GitLab MR
+    │
+    ▼
+Sandmark  ──►  sandmark-history (MongoDB)
+                      │
+          ┌───────────┴────────────┐
+          │                        │
+          ▼                        ▼
+    review_density           defect_escape
+    traceability             risk_closure
+    soup_completeness
+          │
+          ▼
+    GET /metrics/*  (FastAPI)
+```
+
+Each metric is implemented as an independent **agent** — a Python class that connects to MongoDB, runs its aggregation logic, and returns a standardised JSON response.
+
+---
+
+## Metrics Reference
+
+| Agent | Endpoint | What it measures | Source collection |
+|---|---|---|---|
+| `review_density` | `/metrics/review_density` | Average number of Gemini comments per MR; breakdown by comment type and top problematic files | `sandmark-history` |
+| `defect_escape` | `/metrics/defect_escape` | Percentage of MRs with at least one `bug`-type comment; top files with most bugs | `sandmark-history` |
+| `traceability` | `/metrics/traceability` | Percentage of requirements covered by at least one test | `requirements` |
+| `risk_closure` | `/metrics/risk_closure` | Percentage of closed risks; list of overdue open items | `risks` |
+| `soup_completeness` | `/metrics/soup_completeness` | Completeness of the external library (SOUP) register | `soup_register` |
+
+All agents default to the **last 30 days**. If no dated documents exist in that window, the agent falls back to all-time data and sets `"period": "all_time"` in the response.
+
+---
+
+## Project Structure
 
 ```
 QualityMetrics/
-├── main.py                     # punkt wejścia FastAPI
-├── .env                        # konfiguracja połączenia (nie commitować!)
+├── main.py                       # FastAPI application entry point
+├── .env                          # Local connection config (do not commit)
 ├── requirements.txt
+├── seed_data.py                  # Populates test collections
 ├── agents/
-│   ├── __init__.py             # rejestr agentów
-│   ├── base_agent.py           # połączenie z MongoDB, metody pomocnicze
+│   ├── __init__.py               # Agent registry (AGENTS dict)
+│   ├── base_agent.py             # MongoDB connection, shared helpers
 │   ├── review_density.py
 │   ├── defect_escape.py
 │   ├── traceability.py
 │   ├── risk_closure.py
 │   └── soup_completeness.py
-└── backend/
-    └── routers/
-        └── metrics.py          # endpointy REST
+├── backend/
+│   └── routers/
+│       └── metrics.py            # REST endpoints
+└── frontend/
+    └── dashboard.html            # Static HTML dashboard
 ```
 
 ---
 
-## Uruchomienie
+## Getting Started
 
-### 1. Wymagania
+### Prerequisites
 
 - Python 3.11+
-- MongoDB (lokalnie lub Atlas)
-- Działający Sandmark (żeby były dane w `sandmark-history`)
+- MongoDB (local instance or MongoDB Atlas)
+- A running Sandmark instance with data in `sandmark-history` (or use `seed_data.py` for test data)
 
-### 2. Instalacja
+### Installation
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Konfiguracja `.env`
+### Configuration
+
+Create a `.env` file in the project root:
 
 ```env
-# Połączenie z MongoDB (ta sama baza co Sandmark)
+# MongoDB connection string (same database as Sandmark)
 MONGODB_URI=mongodb+srv://user:password@cluster.mongodb.net/
 
-# Nazwa bazy danych
+# Database name
 MONGO_DB_NAME=sandmark-db
 
-# Nazwa kolekcji z przeglądami (domyślnie sandmark-history)
+# Collection names (defaults shown; override only if needed)
 COLLECTION_REVIEW_LOGS=sandmark-history
+COLLECTION_REQUIREMENTS=requirements
+COLLECTION_RISKS=risks
+COLLECTION_SOUP=soup_register
 ```
 
-### 4. Start
+
+### Running the Server
 
 ```bash
 uvicorn main:app --reload
 ```
 
-Swagger UI dostępny pod: **http://localhost:8000/docs**
+The API will be available at `http://localhost:8000`.  
+Interactive Swagger UI: **http://localhost:8000/docs**
 
 ---
 
-## API
+## API Reference
 
-### Pojedyncza metryka
+### Get a single metric
 
 ```
-GET /metrics/{nazwa_agenta}
+GET /metrics/{agent_name}
 ```
 
-Dostępne nazwy: `review_density`, `defect_escape`, `traceability`, `risk_closure`, `soup_completeness`
+Available agent names: `review_density`, `defect_escape`, `traceability`, `risk_closure`, `soup_completeness`
 
 ```bash
 curl http://localhost:8000/metrics/review_density
 curl http://localhost:8000/metrics/defect_escape
 ```
 
-### Dashboard — wszystkie metryki naraz
+### Get all metrics at once
+
+```
+GET /metrics/summary
+```
 
 ```bash
 curl http://localhost:8000/metrics/summary
 ```
 
-### Format odpowiedzi
+Returns a combined `dashboard` object with results from all five agents, plus an `errors` map for any agents that failed.
 
-Każdy agent zwraca ten sam schemat:
+### Response schema
+
+Every agent returns the same envelope:
 
 ```json
 {
@@ -133,41 +183,23 @@ Każdy agent zwraca ten sam schemat:
 }
 ```
 
-Pole `warning` jest wypełnione gdy `sample_size < 30` — wyniki mogą być wtedy mało miarodajne.
+| Field | Type | Description |
+|---|---|---|
+| `metric` | `string` | Agent identifier |
+| `value` | `number` | Primary computed value |
+| `unit` | `string` | Human-readable unit label |
+| `trend` | `"up" \| "down" \| "stable"` | Direction vs. previous 30-day window |
+| `trend_delta` | `number` | Absolute difference from previous period |
+| `period` | `string` | Time window used for computation |
+| `sample_size` | `integer` | Number of documents processed |
+| `warning` | `string \| null` | Populated when `sample_size < 30` |
+| `details` | `object` | Agent-specific breakdown data |
 
 ---
 
-## Dane testowe
+## Data Schema
 
-Jeśli bazy `requirements`, `risks` i `soup_register` są puste, możesz wypełnić je przykładowymi danymi:
-
-```bash
-python seed_data.py
-```
-
-Skrypt wstawia 20 wymagań, 15 ryzyk i 12 bibliotek. Kolekcji `sandmark-history` nie rusza — tam są Twoje realne dane z Sandmarka.
-
----
-
-## Zależności między projektami
-
-```
-GitLab MR
-    │
-    ▼
-Sandmark  ──►  sandmark-history (MongoDB)
-                      │
-                      ▼
-              QualityMetrics  ──►  GET /metrics/*
-```
-
-QualityMetrics jest **tylko do odczytu** — nie modyfikuje żadnej kolekcji.
-
----
-
-## Wymagania dotyczące kolekcji sandmark-history
-
-Agent `review_density` i `defect_escape` oczekują dokumentów w tej strukturze:
+Agents `review_density` and `defect_escape` require documents in `sandmark-history` with this shape:
 
 ```json
 {
@@ -175,11 +207,41 @@ Agent `review_density` i `defect_escape` oczekują dokumentów w tej strukturze:
   "mr_url": "https://gitlab.com/org/repo/-/merge_requests/123",
   "review_json": {
     "comments": [
-      { "file": "src/main.go", "line": 42, "type": "bug", "comment": "..." }
+      {
+        "file": "src/main.go",
+        "line": 42,
+        "type": "bug",
+        "comment": "Potential nil pointer dereference on line 42."
+      }
     ],
-    "summary": "..."
+    "summary": "Overall review summary from Gemini."
   }
 }
 ```
 
-Pole `type` w komentarzach może przyjmować wartości: `bug`, `suggestion`, `style`, `performance`, `security`.
+Valid values for `comment.type`: `bug`, `suggestion`, `style`, `performance`, `security`.
+
+The `timestamp` field accepts both MongoDB `Date` objects and ISO 8601 strings (with or without timezone offset).
+
+---
+
+## Seeding Test Data
+
+If the `requirements`, `risks`, and `soup_register` collections are empty, populate them with sample data:
+
+```bash
+python seed_data.py
+```
+
+This inserts 20 requirements, 15 risks, and 12 SOUP library entries. The `sandmark-history` collection is intentionally left untouched — it holds real Sandmark review data.
+
+---
+
+## Dependencies
+
+| Package | Version | Purpose |
+|---|---|---|
+| `fastapi` | ≥ 0.115.0 | Web framework and OpenAPI docs |
+| `uvicorn[standard]` | ≥ 0.30.0 | ASGI server |
+| `pymongo` | ≥ 4.8.0 | MongoDB driver |
+| `python-dotenv` | ≥ 1.0.1 | `.env` file loading |
